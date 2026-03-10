@@ -1,3 +1,3 @@
 fn main() {
-    println!("Hello, world!");
+    println!("md-prune: not yet implemented");
 }
