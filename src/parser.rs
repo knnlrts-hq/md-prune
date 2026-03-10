@@ -12,6 +12,12 @@ enum ParserState {
     /// Inside a fenced code block. Stores the fence character and
     /// minimum count needed to close it.
     InCodeFence { fence_char: u8, fence_count: usize },
+    /// Inside a display math block (`$$ ... $$`).
+    InDisplayMath,
+    /// Inside an HTML `<table>...</table>` block.
+    InHtmlTable,
+    /// Inside a callout block (`> [!type] ...`).
+    InCallout,
 }
 
 /// Parse a sequence of lines into classified blocks.
@@ -52,6 +58,32 @@ pub fn parse_blocks(lines: &[String]) -> Vec<Block> {
                     state = ParserState::Normal;
                 }
             }
+            ParserState::InDisplayMath => {
+                if let Some(last) = blocks.last_mut() {
+                    last.lines.push(line.clone());
+                }
+                if is_display_math_delimiter(line) {
+                    state = ParserState::Normal;
+                }
+            }
+            ParserState::InHtmlTable => {
+                if let Some(last) = blocks.last_mut() {
+                    last.lines.push(line.clone());
+                }
+                if is_html_table_close(line) {
+                    state = ParserState::Normal;
+                }
+            }
+            ParserState::InCallout => {
+                if is_blockquote_line(line) {
+                    if let Some(last) = blocks.last_mut() {
+                        last.lines.push(line.clone());
+                    }
+                } else {
+                    // Callout ended — re-classify this line in Normal state
+                    state = classify_normal_line(line, &mut blocks);
+                }
+            }
         }
     }
 
@@ -74,12 +106,81 @@ fn classify_normal_line(line: &str, blocks: &mut Vec<Block>) -> ParserState {
         };
     }
 
+    // Display math opening
+    if is_display_math_delimiter(line) {
+        blocks.push(Block {
+            kind: BlockKind::DisplayMath,
+            lines: vec![line.to_string()],
+        });
+        return ParserState::InDisplayMath;
+    }
+
+    // HTML table opening
+    if is_html_table_open(line) {
+        let closes = is_html_table_close(line);
+        blocks.push(Block {
+            kind: BlockKind::HtmlTable,
+            lines: vec![line.to_string()],
+        });
+        if closes {
+            return ParserState::Normal;
+        }
+        return ParserState::InHtmlTable;
+    }
+
+    // Callout: > [!type]
+    if is_callout_start(line) {
+        blocks.push(Block {
+            kind: BlockKind::Callout,
+            lines: vec![line.to_string()],
+        });
+        return ParserState::InCallout;
+    }
+
+    // Blockquote: > ... (not a callout)
+    if is_blockquote_line(line) {
+        push_or_merge(blocks, BlockKind::Blockquote, line.to_string());
+        return ParserState::Normal;
+    }
+
+    // Image line
+    if is_image_line(line) {
+        push_or_merge(blocks, BlockKind::Image, line.to_string());
+        return ParserState::Normal;
+    }
+
+    // List item
+    if is_list_item(line) {
+        push_or_merge(blocks, BlockKind::ListItem, line.to_string());
+        return ParserState::Normal;
+    }
+
+    // Markdown table detection: separator row reclassifies previous paragraph
+    if is_table_separator(line)
+        && let Some(last) = blocks.last_mut()
+        && last.kind == BlockKind::Paragraph
+        && last.lines.iter().all(|l| is_table_row(l))
+    {
+        last.kind = BlockKind::MarkdownTable;
+        last.lines.push(line.to_string());
+        return ParserState::Normal;
+    }
+
+    // Markdown table data row continuation
+    if is_table_row(line)
+        && let Some(last) = blocks.last_mut()
+        && last.kind == BlockKind::MarkdownTable
+    {
+        last.lines.push(line.to_string());
+        return ParserState::Normal;
+    }
+
     let kind = classify_line(line);
     push_or_merge(blocks, kind, line.to_string());
     ParserState::Normal
 }
 
-/// Classify a single line in Normal state.
+/// Classify a single line in Normal state (simple, non-stateful checks).
 fn classify_line(line: &str) -> BlockKind {
     if line.trim().is_empty() {
         return BlockKind::BlankLine;
@@ -104,7 +205,7 @@ fn classify_line(line: &str) -> BlockKind {
 /// Detect if a line opens a fenced code block.
 ///
 /// Returns `Some((fence_char, fence_count))` if the line starts with 3+
-/// backticks or tildes. The `fence_count` is the number of fence characters.
+/// backticks or tildes.
 fn detect_code_fence_open(line: &str) -> Option<(u8, usize)> {
     let trimmed = line.trim_start();
     let first_byte = trimmed.as_bytes().first()?;
@@ -147,11 +248,92 @@ fn is_code_fence_close(line: &str, fence_char: u8, min_count: usize) -> bool {
     trimmed[count..].trim().is_empty()
 }
 
+/// Check if a line is a display math delimiter (`$$`).
+fn is_display_math_delimiter(line: &str) -> bool {
+    line.trim() == "$$"
+}
+
+/// Check if a line opens an HTML table.
+fn is_html_table_open(line: &str) -> bool {
+    let trimmed = line.trim_start().to_ascii_lowercase();
+    trimmed.starts_with("<table")
+}
+
+/// Check if a line closes an HTML table.
+fn is_html_table_close(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("</table>")
+}
+
+/// Check if a line starts a callout block (`> [!type]`).
+fn is_callout_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("> [!")
+}
+
+/// Check if a line is a blockquote continuation (`> ...` or just `>`).
+fn is_blockquote_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with('>')
+}
+
+/// Check if a line is an image (Obsidian `![[...]]` or standard `![...](...)` ).
+fn is_image_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with("![[") && trimmed.ends_with("]]") {
+        return true;
+    }
+    if trimmed.starts_with("![") && trimmed.contains("](") && trimmed.ends_with(')') {
+        return true;
+    }
+    false
+}
+
+/// Check if a line is a list item (unordered or ordered).
+///
+/// Unordered: starts with `-`, `*`, or `+` followed by a space.
+/// Ordered: starts with digits followed by `.` and a space.
+/// Leading whitespace is allowed (for nested lists).
+fn is_list_item(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.len() >= 2 {
+        let first = trimmed.as_bytes()[0];
+        if (first == b'-' || first == b'+') && trimmed.as_bytes()[1] == b' ' {
+            return true;
+        }
+        // Asterisk list item — but NOT bold marker "**"
+        if first == b'*' && trimmed.as_bytes()[1] == b' ' {
+            return true;
+        }
+    }
+    // Ordered: "1. ", "2. ", "10. ", etc.
+    let digit_count = trimmed.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digit_count > 0 && trimmed[digit_count..].starts_with(". ") {
+        return true;
+    }
+    false
+}
+
+/// Check if a line looks like a Markdown table separator row.
+///
+/// Separator rows contain only `|`, `-`, `:`, and whitespace.
+fn is_table_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') || !trimmed.contains('-') {
+        return false;
+    }
+    trimmed.chars().all(|c| matches!(c, '|' | '-' | ':' | ' '))
+}
+
+/// Check if a line looks like a Markdown table row (starts and ends with `|`).
+fn is_table_row(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.starts_with('|') && trimmed.ends_with('|')
+}
+
 /// Append a line to the last block if it has the same kind,
 /// otherwise start a new block.
 fn push_or_merge(blocks: &mut Vec<Block>, kind: BlockKind, line: String) {
-    // Rust note: `last_mut()` returns Option<&mut Block> — a mutable
-    // reference to the last element, if one exists.
     if let Some(last) = blocks.last_mut()
         && last.kind == kind
     {
@@ -311,5 +493,212 @@ mod tests {
         let input = "```\n**not bold**\n```";
         let result = parse_to_kinds(input);
         assert_eq!(result, vec![(BlockKind::CodeBlock, 3)]);
+    }
+
+    // -- Task 8: display math --
+
+    #[test]
+    fn display_math_block() {
+        let input = "before\n$$\nx^2 + y^2 = z^2\n$$\nafter";
+        let result = parse_to_kinds(input);
+        assert_eq!(
+            result,
+            vec![
+                (BlockKind::Paragraph, 1),
+                (BlockKind::DisplayMath, 3),
+                (BlockKind::Paragraph, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn display_math_multiline() {
+        let input = "$$\na = b\nc = d\n$$";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::DisplayMath, 4)]);
+    }
+
+    #[test]
+    fn display_math_unclosed_at_eof() {
+        let input = "$$\nmath\nmore math";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::DisplayMath, 3)]);
+    }
+
+    #[test]
+    fn inline_dollar_not_display_math() {
+        let input = "The value is $x^2$ here";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::Paragraph, 1)]);
+    }
+
+    // -- Task 9: HTML tables --
+
+    #[test]
+    fn html_table() {
+        let input = "before\n<table>\n<tr><td>cell</td></tr>\n</table>\nafter";
+        let result = parse_to_kinds(input);
+        assert_eq!(
+            result,
+            vec![
+                (BlockKind::Paragraph, 1),
+                (BlockKind::HtmlTable, 3),
+                (BlockKind::Paragraph, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_table_with_attributes() {
+        let input = "<table style=\"margin: auto;\">\n<tr><td>x</td></tr>\n</table>";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::HtmlTable, 3)]);
+    }
+
+    #[test]
+    fn html_table_unclosed_at_eof() {
+        let input = "<table>\n<tr><td>cell</td></tr>";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::HtmlTable, 2)]);
+    }
+
+    // -- Task 10: callout blocks and blockquotes --
+
+    #[test]
+    fn callout_block() {
+        let input = "> [!info] Title\n> Content line\n> More content\n\nAfter";
+        let result = parse_to_kinds(input);
+        assert_eq!(
+            result,
+            vec![
+                (BlockKind::Callout, 3),
+                (BlockKind::BlankLine, 1),
+                (BlockKind::Paragraph, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn callout_success_type() {
+        let input = "> [!success] Answer\n> The answer is 42.";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::Callout, 2)]);
+    }
+
+    #[test]
+    fn regular_blockquote_not_callout() {
+        let input = "> Just a quote\n> continuation";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::Blockquote, 2)]);
+    }
+
+    #[test]
+    fn blockquote_single_line() {
+        let input = "> A single line quote";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::Blockquote, 1)]);
+    }
+
+    #[test]
+    fn callout_ends_at_non_quote_line() {
+        let input = "> [!info] Title\n> Line 1\nNot a quote line";
+        let result = parse_to_kinds(input);
+        assert_eq!(
+            result,
+            vec![(BlockKind::Callout, 2), (BlockKind::Paragraph, 1),]
+        );
+    }
+
+    #[test]
+    fn nested_blockquote_in_callout() {
+        let input = "> [!info] Title\n> > Nested quote";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::Callout, 2)]);
+    }
+
+    // -- Task 11: images, list items, Markdown tables --
+
+    #[test]
+    fn obsidian_image() {
+        let result = parse_to_kinds("![[my-image.png]]");
+        assert_eq!(result, vec![(BlockKind::Image, 1)]);
+    }
+
+    #[test]
+    fn standard_markdown_image() {
+        let result = parse_to_kinds("![alt text](https://example.com/img.jpg)");
+        assert_eq!(result, vec![(BlockKind::Image, 1)]);
+    }
+
+    #[test]
+    fn image_with_surrounding_text() {
+        let result = parse_to_kinds("text before\n![img](url)\ntext after");
+        assert_eq!(
+            result,
+            vec![
+                (BlockKind::Paragraph, 1),
+                (BlockKind::Image, 1),
+                (BlockKind::Paragraph, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn unordered_list_item_dash() {
+        let result = parse_to_kinds("- item one\n- item two");
+        assert_eq!(result, vec![(BlockKind::ListItem, 2)]);
+    }
+
+    #[test]
+    fn unordered_list_item_asterisk() {
+        let result = parse_to_kinds("* item one");
+        assert_eq!(result, vec![(BlockKind::ListItem, 1)]);
+    }
+
+    #[test]
+    fn unordered_list_item_plus() {
+        let result = parse_to_kinds("+ item one");
+        assert_eq!(result, vec![(BlockKind::ListItem, 1)]);
+    }
+
+    #[test]
+    fn ordered_list_item() {
+        let result = parse_to_kinds("1. First\n2. Second\n3. Third");
+        assert_eq!(result, vec![(BlockKind::ListItem, 3)]);
+    }
+
+    #[test]
+    fn indented_list_item() {
+        let result = parse_to_kinds("  - nested item");
+        assert_eq!(result, vec![(BlockKind::ListItem, 1)]);
+    }
+
+    #[test]
+    fn markdown_table() {
+        let input = "| Col A | Col B |\n|-------|-------|\n| val   | val   |";
+        let result = parse_to_kinds(input);
+        assert_eq!(result, vec![(BlockKind::MarkdownTable, 3)]);
+    }
+
+    #[test]
+    fn markdown_table_with_surrounding() {
+        let input = "text\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nmore text";
+        let result = parse_to_kinds(input);
+        assert_eq!(
+            result,
+            vec![
+                (BlockKind::Paragraph, 1),
+                (BlockKind::BlankLine, 1),
+                (BlockKind::MarkdownTable, 3),
+                (BlockKind::BlankLine, 1),
+                (BlockKind::Paragraph, 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn pipe_in_paragraph_not_table() {
+        let result = parse_to_kinds("value a | value b");
+        assert_eq!(result, vec![(BlockKind::Paragraph, 1)]);
     }
 }
