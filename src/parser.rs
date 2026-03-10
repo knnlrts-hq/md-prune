@@ -333,8 +333,12 @@ fn is_table_row(line: &str) -> bool {
 
 /// Append a line to the last block if it has the same kind,
 /// otherwise start a new block.
+///
+/// Headings are never merged — each heading line gets its own block
+/// so they can be individually pruned later.
 fn push_or_merge(blocks: &mut Vec<Block>, kind: BlockKind, line: String) {
-    if let Some(last) = blocks.last_mut()
+    if !matches!(kind, BlockKind::Heading { .. })
+        && let Some(last) = blocks.last_mut()
         && last.kind == kind
     {
         last.lines.push(line);
