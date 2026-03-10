@@ -1,0 +1,11 @@
+[package]
+name = "md-prune"
+version = "0.1.0"
+edition = "2024"
+description = "Extract bold and highlighted text from Markdown files"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+regex = "1"
+thiserror = "2"
